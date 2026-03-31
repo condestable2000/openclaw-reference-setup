@@ -644,8 +644,8 @@ Description=OpenClaw Personal AI Assistant Gateway
 Documentation=https://docs.openclaw.ai/gateway
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=5
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -653,9 +653,12 @@ User=$AGENT_USER
 Group=$AGENT_USER
 WorkingDirectory=$AGENT_HOME
 
+# Abort start if no API key has been configured yet
+ExecStartPre=/bin/bash -c 'grep -qE "(ANTHROPIC_API_KEY|OPENAI_API_KEY)=.+" $CREDENTIALS_DIR/env || { echo "ERROR: No API key found in $CREDENTIALS_DIR/env — add ANTHROPIC_API_KEY or OPENAI_API_KEY and run: sudo systemctl start openclaw-gateway"; exit 1; }'
+
 ExecStart=$OPENCLAW_BIN gateway --port $GATEWAY_PORT
 Restart=on-failure
-RestartSec=15
+RestartSec=30
 TimeoutStopSec=30
 
 # Output
@@ -772,25 +775,38 @@ log "Workspace: $WORKSPACE"
     log "Whisper venv: $AGENT_HOME/.venvs/whisper"
 
 # ============================================================================
-# STEP 15: Start the Gateway
+# STEP 15: Start the Gateway (only if API key is present)
 # ============================================================================
 header "Starting OpenClaw Gateway"
 
+# Determine if there is at least one API key configured
+ENV_FILE="$CREDENTIALS_DIR/env"
+HAS_KEY=false
+if [[ -f "$ENV_FILE" ]] && sudo grep -qE '(ANTHROPIC_API_KEY|OPENAI_API_KEY)=.+' "$ENV_FILE" 2>/dev/null; then
+    HAS_KEY=true
+fi
+
 if [[ -f "$SERVICE_FILE" ]]; then
-    if sudo systemctl is-active --quiet openclaw-gateway; then
-        log "Gateway service is already running."
-        sudo systemctl restart openclaw-gateway
-        log "Service restarted."
-    else
-        info "Starting openclaw-gateway service..."
-        sudo systemctl start openclaw-gateway || warn "Service failed to start. Check logs: sudo journalctl -u openclaw-gateway -n 50"
-        sleep 3
+    if $HAS_KEY; then
         if sudo systemctl is-active --quiet openclaw-gateway; then
-            log "Gateway is running!"
+            log "Gateway service is already running."
+            sudo systemctl restart openclaw-gateway
+            log "Service restarted."
         else
-            warn "Gateway may not have started correctly."
-            warn "Run: sudo journalctl -u openclaw-gateway -n 30 --no-pager"
+            info "Starting openclaw-gateway service..."
+            sudo systemctl start openclaw-gateway || warn "Service failed to start. Check logs: sudo journalctl -u openclaw-gateway -n 50"
+            sleep 3
+            if sudo systemctl is-active --quiet openclaw-gateway; then
+                log "Gateway is running!"
+            else
+                warn "Gateway did not start correctly."
+                warn "Check: sudo journalctl -u openclaw-gateway -n 30 --no-pager"
+            fi
         fi
+    else
+        warn "Gateway service NOT started — no API key configured."
+        warn "Service is installed and enabled but will not run until you add a key."
+        info "See the 'What to do next' section below."
     fi
 fi
 
@@ -819,7 +835,21 @@ echo "  • Logs:             $LOG_DIR"
 echo "  • Gateway port:     $GATEWAY_PORT (loopback only)"
 echo "  • systemd service:  openclaw-gateway"
 echo ""
+# Show key status in summary
+KEY_STATUS=$(sudo grep -qE '(ANTHROPIC_API_KEY|OPENAI_API_KEY)=.+' "$CREDENTIALS_DIR/env" 2>/dev/null && echo "configured" || echo "NOT CONFIGURED")
+echo "  • API key:          $KEY_STATUS"
+
 echo -e "${BOLD}${YELLOW}IMPORTANT — What to do next:${RESET}"
+if [[ "$KEY_STATUS" == "NOT CONFIGURED" ]]; then
+echo ""
+echo -e "  ${RED}${BOLD}★ REQUIRED: Add your API key before the gateway can start:${RESET}"
+echo "     sudo nano $CREDENTIALS_DIR/env"
+echo "     (Add one of these lines:)"
+echo "       ANTHROPIC_API_KEY=sk-ant-..."
+echo "       OPENAI_API_KEY=sk-..."
+echo "     Then start the gateway:"
+echo "     sudo systemctl start openclaw-gateway"
+fi
 echo ""
 echo "  1. Customize your agent identity:"
 echo "     sudo nano $WORKSPACE/SOUL.md"
@@ -828,9 +858,8 @@ echo ""
 echo "  2. Add your personal context:"
 echo "     sudo nano $WORKSPACE/USER.md"
 echo ""
-echo "  3. Add API keys (if you skipped the prompts):"
+echo "  3. API keys (credentials file):"
 echo "     sudo nano $CREDENTIALS_DIR/env"
-echo "     (Add lines like: ANTHROPIC_API_KEY=sk-ant-...)"
 echo "     sudo systemctl restart openclaw-gateway"
 echo ""
 echo "  4. Connect a messaging channel (Telegram recommended):"
