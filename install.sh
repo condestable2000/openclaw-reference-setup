@@ -42,16 +42,58 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
-log()    { echo -e "${GREEN}[✔]${RESET} $*"; }
-info()   { echo -e "${CYAN}[→]${RESET} $*"; }
-warn()   { echo -e "${YELLOW}[⚠]${RESET} $*"; }
-error()  { echo -e "${RED}[✘]${RESET} $*" >&2; }
+DIM='\033[2m'
+
+log()    { echo -e " ${GREEN}✓${RESET} $*"; }
+info()   { echo -e "  ${CYAN}→${RESET} $*"; }
+warn()   { echo -e " ${YELLOW}!${RESET} $*"; }
+error()  { echo -e "\n${RED}  ✗ ERROR: $*${RESET}\n" >&2; exit 1; }
 header() {
     echo ""
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
     echo -e "${BOLD}${CYAN}  $*${RESET}"
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
 }
+
+TOTAL_STEPS=15
+step() {
+    echo ""
+    echo -e "${BOLD}${CYAN}[$1/$TOTAL_STEPS]${RESET} ${BOLD}$2${RESET}\n"
+}
+
+# ask <prompt> <varname> [default]
+# Reads from /dev/tty so it works with curl | bash
+ask() {
+    local prompt="$1" varname="$2" default="${3:-}"
+    local display_default=""
+    [[ -n "$default" ]] && display_default=" ${DIM}[$default]${RESET}"
+    echo -en "  ${BOLD}${prompt}${RESET}${display_default}: " >/dev/tty
+    local val
+    read -r val </dev/tty || val=""
+    [[ -z "$val" ]] && val="$default"
+    printf -v "$varname" '%s' "$val"
+}
+
+# ask_secret <prompt> <varname>  — hides input
+ask_secret() {
+    local prompt="$1" varname="$2"
+    echo -en "  ${BOLD}${prompt}${RESET}: " >/dev/tty
+    local val
+    read -rs val </dev/tty || val=""
+    echo >/dev/tty
+    printf -v "$varname" '%s' "$val"
+}
+
+# confirm <prompt>  — returns 0 for yes, 1 for no
+confirm() {
+    echo -en "  ${BOLD}$1${RESET} ${DIM}[s/N]${RESET}: " >/dev/tty
+    local ans
+    read -r ans </dev/tty || ans=""
+    [[ "$ans" =~ ^[sS]$ ]]
+}
+
+# separator line
+sep() { echo -e "  ${DIM}──────────────────────────────────────────────────${RESET}"; }
 
 # ---------------------------------------------------------------------------
 # Configuration defaults (override via environment variables)
@@ -62,9 +104,10 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 PIPER_VERSION="${PIPER_VERSION:-2023.11.14-2}"
 REPO_URL="https://raw.githubusercontent.com/condestable2000/openclaw-reference-setup/main"
 
-# Detect if we're running interactively (not via curl | bash)
+# Detect if a real terminal is available for user input
+# Works correctly with both 'curl | bash' and direct execution
 INTERACTIVE=false
-[[ -t 0 ]] && INTERACTIVE=true
+[[ -e /dev/tty ]] && INTERACTIVE=true
 
 # Resolve the directory where this script lives (works with both local and piped runs)
 if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
@@ -88,6 +131,21 @@ cleanup() {
     [[ -n "$TMP_WORKDIR" && -d "$TMP_WORKDIR" ]] && rm -rf "$TMP_WORKDIR"
 }
 trap cleanup EXIT
+
+# ── Banner ──────────────────────────────────────────────────────────────────
+clear 2>/dev/null || true
+echo ""
+echo -e "${BOLD}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║                                                ║"
+echo "  ║   🦞  OpenClaw Installer                       ║"
+echo "  ║        Referencia de producción para Ubuntu    ║"
+echo "  ║                                                ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+echo -e "  Instala y configura OpenClaw con seguridad en minutos."
+echo -e "  ${DIM}https://github.com/condestable2000/openclaw-reference-setup${RESET}"
+echo ""
 
 # ---------------------------------------------------------------------------
 # Helper: copy a file only if the destination doesn't already exist
@@ -122,7 +180,7 @@ fetch_file() {
 # ============================================================================
 # STEP 0: Preflight checks
 # ============================================================================
-header "Preflight Checks"
+step 0 "Verificando el sistema"
 
 # Must NOT run as root
 if [[ "$EUID" -eq 0 ]]; then
@@ -340,31 +398,205 @@ fi
 [[ -f "$EXEC_APPROVALS_SRC" ]]  && copy_if_missing "$EXEC_APPROVALS_SRC"  "$OPENCLAW_DIR/exec-approvals.json" "$AGENT_USER:$AGENT_USER" "640"
 
 # ============================================================================
-# STEP 7: OpenClaw Configuration (openclaw.json)
+# STEP 7: Wizard de configuración mínima
 # ============================================================================
-header "Configuring OpenClaw"
+header "Configuración de tu agente"
 
+# Variables que recoge el wizard
+WIZARD_AGENT_NAME=""
+WIZARD_PROVIDER=""        # anthropic | openai
+WIZARD_API_KEY=""
+WIZARD_MODEL=""
+WIZARD_CHANNEL=""         # telegram | discord | whatsapp | none
+WIZARD_CHANNEL_TOKEN=""
+WIZARD_CHANNEL_CONFIG=""
 ANTHROPIC_KEY=""
 OPENAI_KEY=""
 TELEGRAM_TOKEN=""
 
 if [[ -f "$OPENCLAW_CONFIG" ]]; then
-    warn "openclaw.json already exists — skipping. Edit manually: sudo nano $OPENCLAW_CONFIG"
+    warn "openclaw.json ya existe — se mantiene la configuración existente."
+    info "Para reconfigurar: sudo -u $AGENT_USER openclaw onboard"
 else
     if $INTERACTIVE; then
         echo ""
-        info "You can configure API keys now, or press Enter to skip any field."
-        info "Keys will be stored with chmod 600 in $CREDENTIALS_DIR"
+        echo -e "  Responde estas preguntas para configurar lo mínimo necesario."
+        echo -e "  ${DIM}Todos los valores se pueden cambiar después.${RESET}"
         echo ""
-        read -rp "  Anthropic API key (claude models) [Enter to skip]: " ANTHROPIC_KEY
-        read -rp "  OpenAI API key [Enter to skip]:                     " OPENAI_KEY
-        read -rp "  Telegram bot token [Enter to skip]:                 " TELEGRAM_TOKEN
-        read -rp "  Gateway port [$GATEWAY_PORT]:                       " USER_PORT
-        [[ -n "$USER_PORT" ]] && GATEWAY_PORT="$USER_PORT"
+
+        # ── [1/4] Nombre del agente ────────────────────────────────────────
+        echo -e "  ${BOLD}[1/4] Nombre de tu agente${RESET}"
+        sep
+        echo -e "  ${DIM}El nombre con el que se presentará tu IA.${RESET}"
+        echo -e "  ${DIM}Ejemplos: Atlas, Jarvis, Luna, Max${RESET}"
+        echo ""
+        ask "Nombre del agente" WIZARD_AGENT_NAME "Atlas"
+        echo ""
+
+        # ── [2/4] Proveedor de IA ──────────────────────────────────────────
+        echo -e "  ${BOLD}[2/4] Proveedor de IA${RESET}"
+        sep
+        echo -e "  ${DIM}Qué modelo usará tu agente para pensar.${RESET}"
+        echo ""
+        echo -e "    ${BOLD}1)${RESET} Anthropic Claude  ${DIM}(recomendado — sk-ant-...)${RESET}"
+        echo -e "    ${BOLD}2)${RESET} OpenAI GPT         ${DIM}(sk-...)${RESET}"
+        echo ""
+        ask "Elige proveedor" _PROVIDER_CHOICE "1"
+        echo ""
+
+        if [[ "$_PROVIDER_CHOICE" == "2" ]]; then
+            WIZARD_PROVIDER="openai"
+            WIZARD_MODEL="openai/gpt-4o"
+            echo -e "  ${DIM}Obtén tu clave en: https://platform.openai.com/api-keys${RESET}"
+            echo ""
+            while true; do
+                ask_secret "API Key de OpenAI" WIZARD_API_KEY
+                if [[ "${WIZARD_API_KEY:0:3}" == "sk-" && ${#WIZARD_API_KEY} -gt 20 ]]; then
+                    log "API key de OpenAI aceptada."
+                    break
+                elif [[ -z "$WIZARD_API_KEY" ]]; then
+                    warn "Sin API key — podrás añadirla después en $CREDENTIALS_DIR/env"
+                    break
+                else
+                    warn "La clave no parece válida (debe empezar por sk-). Inténtalo de nuevo o deja vacío."
+                fi
+            done
+            OPENAI_KEY="$WIZARD_API_KEY"
+        else
+            WIZARD_PROVIDER="anthropic"
+            WIZARD_MODEL="anthropic/claude-opus-4-6"
+            echo -e "  ${DIM}Obtén tu clave en: https://console.anthropic.com/settings/keys${RESET}"
+            echo ""
+            while true; do
+                ask_secret "API Key de Anthropic" WIZARD_API_KEY
+                if [[ "${WIZARD_API_KEY:0:7}" == "sk-ant-" && ${#WIZARD_API_KEY} -gt 20 ]]; then
+                    log "API key de Anthropic aceptada."
+                    break
+                elif [[ -z "$WIZARD_API_KEY" ]]; then
+                    warn "Sin API key — podrás añadirla después en $CREDENTIALS_DIR/env"
+                    break
+                else
+                    warn "La clave no parece válida (debe empezar por sk-ant-). Inténtalo de nuevo o deja vacío."
+                fi
+            done
+            ANTHROPIC_KEY="$WIZARD_API_KEY"
+        fi
+        echo ""
+
+        # ── [3/4] Canal de mensajería ──────────────────────────────────────
+        echo -e "  ${BOLD}[3/4] Canal de mensajería${RESET}"
+        sep
+        echo -e "  ${DIM}Cómo te comunicarás con tu agente.${RESET}"
+        echo ""
+        echo -e "    ${BOLD}1)${RESET} Telegram   ${DIM}(recomendado — @BotFather)${RESET}"
+        echo -e "    ${BOLD}2)${RESET} Discord    ${DIM}(discord.com/developers)${RESET}"
+        echo -e "    ${BOLD}3)${RESET} WhatsApp   ${DIM}(configuración avanzada)${RESET}"
+        echo -e "    ${BOLD}4)${RESET} Configurar más tarde"
+        echo ""
+        ask "Elige canal" _CHANNEL_CHOICE "1"
+        echo ""
+
+        case "$_CHANNEL_CHOICE" in
+            2)
+                WIZARD_CHANNEL="discord"
+                echo -e "  ${DIM}Token del bot en: https://discord.com/developers/applications${RESET}"
+                echo ""
+                ask_secret "Token de bot de Discord" WIZARD_CHANNEL_TOKEN
+                WIZARD_CHANNEL_CONFIG='"discord": { "token": "'"$WIZARD_CHANNEL_TOKEN"'" }'
+                ;;
+            3)
+                WIZARD_CHANNEL="whatsapp"
+                warn "WhatsApp requiere enlazar el dispositivo con QR después de instalar."
+                info "Ejecuta cuando quieras: sudo -u $AGENT_USER openclaw channels login"
+                WIZARD_CHANNEL_TOKEN=""
+                ;;
+            4)
+                WIZARD_CHANNEL="none"
+                warn "Sin canal — usa WebChat local o configura más tarde con: sudo -u $AGENT_USER openclaw onboard"
+                WIZARD_CHANNEL_TOKEN=""
+                ;;
+            *)
+                WIZARD_CHANNEL="telegram"
+                echo -e "  ${DIM}Crea un bot con @BotFather en Telegram y copia el token.${RESET}"
+                echo -e "  ${DIM}El token tiene formato:  123456789:ABCdefGHIjklMNOpqrSTUvwxyz${RESET}"
+                echo ""
+                while true; do
+                    ask_secret "Token de bot de Telegram" WIZARD_CHANNEL_TOKEN
+                    if [[ "$WIZARD_CHANNEL_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+                        log "Token de Telegram aceptado."
+                        break
+                    elif [[ -z "$WIZARD_CHANNEL_TOKEN" ]]; then
+                        warn "Sin token — podrás añadirlo después en $CREDENTIALS_DIR/env"
+                        break
+                    else
+                        warn "El token no parece válido. Inténtalo de nuevo o deja vacío."
+                    fi
+                done
+                TELEGRAM_TOKEN="$WIZARD_CHANNEL_TOKEN"
+                WIZARD_CHANNEL_CONFIG='"telegram": { "botToken": "'"$WIZARD_CHANNEL_TOKEN"'" }'
+                ;;
+        esac
+        echo ""
+
+        # ── [4/4] Puerto del gateway ───────────────────────────────────────
+        echo -e "  ${BOLD}[4/4] Puerto del gateway${RESET}"
+        sep
+        echo -e "  ${DIM}Puerto local donde escuchará el gateway (solo loopback).${RESET}"
+        echo ""
+        ask "Puerto" USER_PORT "$GATEWAY_PORT"
+        [[ "$USER_PORT" =~ ^[0-9]+$ ]] && GATEWAY_PORT="$USER_PORT"
+        echo ""
+
+        # ── Resumen y confirmación ─────────────────────────────────────────
+        CHANNEL_DISPLAY="${WIZARD_CHANNEL:-ninguno}"
+        [[ "$CHANNEL_DISPLAY" == "none" ]] && CHANNEL_DISPLAY="configurar más tarde"
+        KEY_DISPLAY="${DIM}(no configurada)${RESET}"
+        [[ -n "$WIZARD_API_KEY" ]] && KEY_DISPLAY="✓ configurada"
+
+        echo -e "  ${BOLD}Resumen de configuración:${RESET}"
+        echo "  ┌─────────────────────────────────────────────────────┐"
+        printf  "  │  %-10s  %-38s│\n" "Agente:"    "$WIZARD_AGENT_NAME"
+        printf  "  │  %-10s  %-38s│\n" "Proveedor:" "${WIZARD_PROVIDER:-anthropic} (${WIZARD_MODEL:-claude-opus-4-6})"
+        echo -e "  │  API key:    $KEY_DISPLAY"
+        printf  "  │  %-10s  %-38s│\n" "Canal:"     "$CHANNEL_DISPLAY"
+        printf  "  │  %-10s  %-38s│\n" "Puerto:"    "$GATEWAY_PORT"
+        echo    "  └─────────────────────────────────────────────────────┘"
+        echo ""
+
+        if ! confirm "¿Guardar esta configuración?"; then
+            warn "Configuración cancelada. Se usarán los valores por defecto."
+            WIZARD_AGENT_NAME="Atlas"
+            WIZARD_PROVIDER="anthropic"
+            WIZARD_MODEL="anthropic/claude-opus-4-6"
+            ANTHROPIC_KEY=""
+            OPENAI_KEY=""
+            TELEGRAM_TOKEN=""
+        fi
     else
-        warn "Non-interactive mode: skipping API key prompts. Configure manually later."
-        warn "  Edit: $OPENCLAW_CONFIG"
-        warn "  Edit: $CREDENTIALS_DIR/env"
+        warn "Modo no interactivo (curl | bash sin terminal): omitiendo wizard."
+        warn "Configura manualmente después:"
+        warn "  sudo nano $CREDENTIALS_DIR/env"
+        WIZARD_AGENT_NAME="Atlas"
+        WIZARD_PROVIDER="anthropic"
+        WIZARD_MODEL="anthropic/claude-opus-4-6"
+    fi
+
+    # ── Aplicar nombre al SOUL.md ──────────────────────────────────────────
+    if [[ -n "$WIZARD_AGENT_NAME" && -f "$WORKSPACE/SOUL.md" ]]; then
+        sudo sed -i "s/\\[Agent Name\\]/$WIZARD_AGENT_NAME/g" "$WORKSPACE/SOUL.md"
+        log "Nombre del agente aplicado a SOUL.md: $WIZARD_AGENT_NAME"
+    fi
+
+    # ── Modelo en openclaw.json ────────────────────────────────────────────
+    FINAL_MODEL="${WIZARD_MODEL:-anthropic/claude-opus-4-6}"
+
+    # ── Construir sección channels para openclaw.json ─────────────────────
+    CHANNELS_BLOCK=""
+    if [[ -n "${WIZARD_CHANNEL_CONFIG:-}" ]]; then
+        CHANNELS_BLOCK=",
+  \"channels\": {
+    ${WIZARD_CHANNEL_CONFIG}
+  }"
     fi
 
     # Write the minimal openclaw.json config (no secrets inside)
@@ -375,21 +607,21 @@ else
     "bind": "loopback"
   },
   "agent": {
-    "model": "anthropic/claude-opus-4-6"
+    "model": "$FINAL_MODEL"
   },
   "agents": {
     "defaults": {
       "workspace": "$WORKSPACE"
     }
-  }
+  }$CHANNELS_BLOCK
 }
 ENDOFCONFIG
 
     sudo chown "$AGENT_USER:$AGENT_USER" "$OPENCLAW_CONFIG"
     sudo chmod 600 "$OPENCLAW_CONFIG"
-    log "openclaw.json created (port $GATEWAY_PORT, model: anthropic/claude-opus-4-6)."
+    log "openclaw.json creado (puerto $GATEWAY_PORT, modelo: $FINAL_MODEL)."
 
-    # Build the credentials env file (loaded by systemd)
+    # ── Guardar secretos en el fichero de entorno (cargado por systemd) ───
     ENV_FILE="$CREDENTIALS_DIR/env"
     sudo touch "$ENV_FILE"
     sudo chown "$AGENT_USER:$AGENT_USER" "$ENV_FILE"
@@ -397,15 +629,15 @@ ENDOFCONFIG
 
     if [[ -n "$ANTHROPIC_KEY" ]]; then
         echo "ANTHROPIC_API_KEY=$ANTHROPIC_KEY" | sudo tee -a "$ENV_FILE" > /dev/null
-        log "Anthropic API key saved to $ENV_FILE"
+        log "API key de Anthropic guardada en $ENV_FILE"
     fi
     if [[ -n "$OPENAI_KEY" ]]; then
         echo "OPENAI_API_KEY=$OPENAI_KEY" | sudo tee -a "$ENV_FILE" > /dev/null
-        log "OpenAI API key saved to $ENV_FILE"
+        log "API key de OpenAI guardada en $ENV_FILE"
     fi
     if [[ -n "$TELEGRAM_TOKEN" ]]; then
         echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN" | sudo tee -a "$ENV_FILE" > /dev/null
-        log "Telegram bot token saved to $ENV_FILE"
+        log "Token de Telegram guardado en $ENV_FILE"
     fi
 fi
 
@@ -811,78 +1043,96 @@ if [[ -f "$SERVICE_FILE" ]]; then
 fi
 
 # ============================================================================
-# DONE — Summary
+# DONE — Resumen final
 # ============================================================================
-echo ""
-echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}${GREEN}║   OpenClaw Installation Complete! 🦞              ║${RESET}"
-echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════╝${RESET}"
-echo ""
-echo -e "${BOLD}Installed components:${RESET}"
-echo "  • OpenClaw:         $(openclaw --version 2>/dev/null || echo 'installed')"
-echo "  • Node.js:          $(node --version)"
-echo "  • Ollama:           $(ollama --version 2>/dev/null || echo 'installed')"
-echo "  • Piper TTS:        $(command -v piper &>/dev/null && echo 'installed' || echo 'not installed')"
-echo "  • Faster-Whisper:   $([[ -f "$AGENT_HOME/.venvs/whisper/bin/activate" ]] && echo 'installed' || echo 'not installed')"
-echo "  • ffmpeg / lame:    $(command -v ffmpeg &>/dev/null && echo 'installed' || echo 'missing')"
-echo ""
-echo -e "${BOLD}System configuration:${RESET}"
-echo "  • Agent user:       $AGENT_USER (no sudo, isolated)"
-echo "  • Workspace:        $WORKSPACE"
-echo "  • Config:           $OPENCLAW_CONFIG (chmod 600)"
-echo "  • Credentials:      $CREDENTIALS_DIR (chmod 700)"
-echo "  • Logs:             $LOG_DIR"
-echo "  • Gateway port:     $GATEWAY_PORT (loopback only)"
-echo "  • systemd service:  openclaw-gateway"
-echo ""
-# Show key status in summary
-KEY_STATUS=$(sudo grep -qE '(ANTHROPIC_API_KEY|OPENAI_API_KEY)=.+' "$CREDENTIALS_DIR/env" 2>/dev/null && echo "configured" || echo "NOT CONFIGURED")
-echo "  • API key:          $KEY_STATUS"
 
-echo -e "${BOLD}${YELLOW}IMPORTANT — What to do next:${RESET}"
-if [[ "$KEY_STATUS" == "NOT CONFIGURED" ]]; then
-echo ""
-echo -e "  ${RED}${BOLD}★ REQUIRED: Add your API key before the gateway can start:${RESET}"
-echo "     sudo nano $CREDENTIALS_DIR/env"
-echo "     (Add one of these lines:)"
-echo "       ANTHROPIC_API_KEY=sk-ant-..."
-echo "       OPENAI_API_KEY=sk-..."
-echo "     Then start the gateway:"
-echo "     sudo systemctl start openclaw-gateway"
+# Determinar estado de API key y canal
+KEY_STATUS="no configurada"
+KEY_OK=false
+if sudo grep -qE '(ANTHROPIC_API_KEY|OPENAI_API_KEY)=.+' "$CREDENTIALS_DIR/env" 2>/dev/null; then
+    KEY_STATUS="${GREEN}✓ configurada${RESET}"
+    KEY_OK=true
 fi
+
+CHANNEL_SUMMARY="${WIZARD_CHANNEL:-ninguno}"
+[[ "$CHANNEL_SUMMARY" == "none" || -z "$CHANNEL_SUMMARY" ]] && CHANNEL_SUMMARY="configurar más tarde"
+
+GW_STATUS="detenido (falta API key)"
+if $KEY_OK && sudo systemctl is-active --quiet openclaw-gateway 2>/dev/null; then
+    GW_STATUS="${GREEN}✓ en ejecución${RESET} (puerto $GATEWAY_PORT)"
+elif $KEY_OK; then
+    GW_STATUS="${YELLOW}instalado, no iniciado${RESET}"
+fi
+
 echo ""
-echo "  1. Customize your agent identity:"
-echo "     sudo nano $WORKSPACE/SOUL.md"
-echo "     (Replace [Agent Name] with a name you like)"
+echo -e "${BOLD}${GREEN}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║                                                ║"
+echo "  ║   🦞  ¡Instalación completada!                 ║"
+echo "  ║                                                ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+echo -e "  ${BOLD}Componentes instalados:${RESET}"
+echo "  ────────────────────────────────────────────────"
+printf  "    %-20s %s\n" "OpenClaw:"      "$(openclaw --version 2>/dev/null || echo 'instalado')"
+printf  "    %-20s %s\n" "Node.js:"       "$(node --version)"
+printf  "    %-20s %s\n" "Ollama:"        "$(ollama --version 2>/dev/null | head -1 || echo 'instalado')"
+printf  "    %-20s %s\n" "Piper TTS:"     "$(command -v piper &>/dev/null && echo 'instalado' || echo 'no instalado')"
+printf  "    %-20s %s\n" "Faster-Whisper:" "$([[ -f "$AGENT_HOME/.venvs/whisper/bin/activate" ]] && echo 'instalado' || echo 'no instalado')"
+printf  "    %-20s %s\n" "ffmpeg / lame:" "$(command -v ffmpeg &>/dev/null && echo 'instalado' || echo 'error')"
 echo ""
-echo "  2. Add your personal context:"
-echo "     sudo nano $WORKSPACE/USER.md"
+echo -e "  ${BOLD}Configuración del sistema:${RESET}"
+echo "  ────────────────────────────────────────────────"
+printf  "    %-20s %s\n" "Usuario agente:" "$AGENT_USER (sin sudo, aislado)"
+printf  "    %-20s %s\n" "Workspace:"     "$WORKSPACE"
+printf  "    %-20s %s\n" "Credenciales:"  "$CREDENTIALS_DIR (chmod 700)"
+printf  "    %-20s %s\n" "Logs:"          "$LOG_DIR"
+printf  "    %-20s %s\n" "Canal:"         "$CHANNEL_SUMMARY"
+echo -e "    $(printf '%-20s' 'API key:')      $KEY_STATUS"
+echo -e "    $(printf '%-20s' 'Gateway:')      $GW_STATUS"
 echo ""
-echo "  3. API keys (credentials file):"
-echo "     sudo nano $CREDENTIALS_DIR/env"
-echo "     sudo systemctl restart openclaw-gateway"
+
+if ! $KEY_OK; then
+    echo -e "  ${RED}${BOLD}╔════════════════════════════════════════════════════╗${RESET}"
+    echo -e "  ${RED}${BOLD}║  ★  ACCIÓN REQUERIDA — el gateway no puede arrancar  ║${RESET}"
+    echo -e "  ${RED}${BOLD}╚════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+    echo -e "  Añade tu API key y arranca el servicio:"
+    echo ""
+    echo -e "    ${CYAN}sudo nano $CREDENTIALS_DIR/env${RESET}"
+    echo ""
+    echo -e "    ${DIM}# Añade UNA de estas líneas:${RESET}"
+    echo -e "    ${DIM}ANTHROPIC_API_KEY=sk-ant-...${RESET}"
+    echo -e "    ${DIM}OPENAI_API_KEY=sk-...${RESET}"
+    echo ""
+    echo -e "    ${CYAN}sudo systemctl start openclaw-gateway${RESET}"
+    echo ""
+fi
+
+echo -e "  ${BOLD}Próximos pasos:${RESET}"
+echo "  ────────────────────────────────────────────────"
 echo ""
-echo "  4. Connect a messaging channel (Telegram recommended):"
-echo "     sudo -u $AGENT_USER openclaw onboard"
+echo -e "    ${BOLD}1.${RESET} Personaliza la identidad de tu agente:"
+echo -e "       ${CYAN}sudo nano $WORKSPACE/SOUL.md${RESET}"
 echo ""
-echo "  5. Review the exec approvals allowlist:"
-echo "     sudo nano $OPENCLAW_DIR/exec-approvals.json"
+echo -e "    ${BOLD}2.${RESET} Añade tu contexto personal:"
+echo -e "       ${CYAN}sudo nano $WORKSPACE/USER.md${RESET}"
 echo ""
-echo "  6. Check gateway health:"
-echo "     openclaw-status"
-echo "     sudo -u $AGENT_USER openclaw doctor"
+echo -e "    ${BOLD}3.${RESET} Wizard nativo (canal, modelo, avanzado):"
+echo -e "       ${CYAN}sudo -u $AGENT_USER openclaw onboard${RESET}"
 echo ""
-echo "  7. Check service status:"
-echo "     sudo systemctl status openclaw-gateway"
-echo "     sudo journalctl -u openclaw-gateway -f"
+echo -e "    ${BOLD}4.${RESET} Comprueba el estado del gateway:"
+echo -e "       ${CYAN}openclaw-status${RESET}"
+echo -e "       ${CYAN}sudo journalctl -u openclaw-gateway -f${RESET}"
 echo ""
-echo -e "${BOLD}Useful commands:${RESET}"
-echo "  openclaw-status                     — Quick health check"
-echo "  sudo -u $AGENT_USER openclaw doctor    — Full diagnostics"
-echo "  sudo systemctl restart openclaw-gateway — Restart gateway"
-echo "  tts.sh \"Hello world\"               — Test TTS"
-echo "  whisper-transcribe audio.ogg        — Test STT"
+echo -e "  ${BOLD}Comandos útiles:${RESET}"
+echo "  ────────────────────────────────────────────────"
+echo -e "    ${CYAN}openclaw-status${RESET}                          Ver estado"
+echo -e "    ${CYAN}sudo systemctl restart openclaw-gateway${RESET}  Reiniciar"
+echo -e "    ${CYAN}sudo -u $AGENT_USER openclaw doctor${RESET}       Diagnóstico completo"
+echo -e "    ${CYAN}tts.sh \"Hola mundo\"${RESET}                     Test TTS"
 echo ""
-echo -e "${BOLD}Documentation:${RESET}  https://docs.openclaw.ai"
-echo -e "${BOLD}Reference repo:${RESET} https://github.com/condestable2000/openclaw-reference-setup"
+echo -e "  ${BOLD}Documentación:${RESET}   https://docs.openclaw.ai"
+echo -e "  ${BOLD}Repositorio:${RESET}     https://github.com/condestable2000/openclaw-reference-setup"
 echo ""
